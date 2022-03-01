@@ -60,6 +60,11 @@ do
     ARG_COUNTER=$((ARG_COUNTER + 1))
 done
 
+if [ "$ARG_COUNTER" = "1" ]; then
+    echo "no arguments, use --help"
+    exit 2
+fi
+
 VOLUME_BACKUP_IMAGE_NAME=docker-volume-backup-helper
 VOLUME_BACKUP_IMAGE_VERSION=1
 VOLUME_BACKUP_IMAGE="$VOLUME_BACKUP_IMAGE_NAME:$VOLUME_BACKUP_IMAGE_VERSION"
