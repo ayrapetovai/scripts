@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+
+USER_COMMAND=
+USER_COMMAND_TARGETS=
+BACKUP_DIRECTORY=
+USE_FORCE=no
+ARG_COUNTER=1
+
+set $(getopt --path: "$@")
+while [ $# -gt 0 ]
+do
+    case "$1" in
+    backup|restore|clean)
+      if [ "$ARG_COUNTER" = "1" ]; then
+        USER_COMMAND="$1"
+        if [ $USER_COMMAND = backup ]; then
+          BACKUP_DIRECTORY=$(pwd)
+        fi
+      else
+        echo ERROR first argument must be command, \'backup\' or \'restore\'
+        exit 2
+      fi
+      ;;
+    -f)
+      USE_FORCE=yes
+      ;;
+    --path)
+        if [ $USER_COMMAND = backup ]; then
+          BACKUP_DIRECTORY="$(cd "$(dirname "$2")" ; pwd -P)/$(basename "$2")" # absolute path
+          shift 1
+        else
+          echo "The --path key works only with backup command"
+          exit 2
+        fi
+      ;;
+    --help|-h)
+      echo "This script saves content of docker volume to file.tar (BACKUP), "
+      echo " and creates volume out of file.tar (RESTORE), created from the volume."
+      echo "BACKUP usage: "
+      echo "  docker-volume-backup backup [--path PATH] [VOLUME...]"
+      echo "    PATH    - directory for backups, \$PWD by default."
+      echo "    VOLUMEs - names of docker volumes to be backed up in folder PATH, all volumes by default"
+      echo "RESTORE usage: "
+      echo "  docker-volume-backup restore [-f] [FILE...|PATH...]"
+      echo "    -f      - remove previous volume, prune containers if needed, interactive."
+      echo "    PATHs   - directories of backups, where all *.tar files to be restored located."
+      echo "    FILEs   - docker volume backups files *.tar, that were created by this script."
+      exit 2
+      ;;
+    *)
+      if [ "$ARG_COUNTER" = "1" ]; then
+          echo ERROR invalid command \'"$1"\', only \'backup\' and \'restore\' alowed;
+          exit 1
+        else
+          USER_COMMAND_TARGETS="$USER_COMMAND_TARGETS $1"
+      fi
+      ;;
+    esac
+    shift
+    ARG_COUNTER=$((ARG_COUNTER + 1))
+done
+
+VOLUME_BACKUP_IMAGE_NAME=docker-volume-backup-helper
+VOLUME_BACKUP_IMAGE_VERSION=1
+VOLUME_BACKUP_IMAGE="$VOLUME_BACKUP_IMAGE_NAME:$VOLUME_BACKUP_IMAGE_VERSION"
+
+export PATH_TO_IMAGE_BUILD_DIR=/tmp/docker-volume-backup-helper
+
+function build_and_install_helper {
+  # TODO check if dir creation permitted
+  mkdir -p "$PATH_TO_IMAGE_BUILD_DIR"
+
+  echo '
+FROM alpine:latest
+COPY --chmod=777 backup-volumes.sh /var/backup-volumes.sh
+CMD sh /var/backup-volumes.sh
+  ' > "$PATH_TO_IMAGE_BUILD_DIR"/Dockerfile
+
+  echo '
+#!/bin/env bash
+if [ $COMMAND = BACKUP ]; then
+	cd /var/src && tar -c ./ > /var/dst/"$VOLUME_NAME".tar
+	exit $?
+elif [ $COMMAND = RESTORE ]; then
+	cd /var/dst/ && tar -xf /var/src/"$VOLUME_NAME".tar
+	exit $?
+else
+	exit 1
+fi
+  ' > "$PATH_TO_IMAGE_BUILD_DIR"/backup-volumes.sh
+
+  function clear_building_docker_backup_helper_image {
+      rm "$PATH_TO_IMAGE_BUILD_DIR"/Dockerfile
+      rm "$PATH_TO_IMAGE_BUILD_DIR"/backup-volumes.sh
+      rmdir "$PATH_TO_IMAGE_BUILD_DIR"
+  }
+
+  docker build -t "$VOLUME_BACKUP_IMAGE_NAME:$VOLUME_BACKUP_IMAGE_VERSION" "$PATH_TO_IMAGE_BUILD_DIR"
+  if [ "$?" -ne "0" ]; then
+    echo ERROR cannot build helper image
+    clear_building_docker_backup_helper_image
+    exit 1
+  fi
+
+  clear_building_docker_backup_helper_image
+
+  return $?
+}
+
+# check if docker available
+docker --version > /dev/null
+
+if [ "$?" -ne "0" ]; then
+  echo ERROR docker is not available
+  exit 1
+fi
+
+VB_INSTALLED_IMAGE=$(docker images "$VOLUME_BACKUP_IMAGE_NAME" --format '{{.Repository}}:{{.Tag}}')
+
+if ! [[ "$VB_INSTALLED_IMAGE" =~ "$VOLUME_BACKUP_IMAGE" ]]; then
+  # no helper image installed
+  build_and_install_helper
+fi
+
+if [ "$USER_COMMAND" = backup ]; then
+  mkdir -p "$BACKUP_DIRECTORY"
+  # TODO exit if $? != 0
+  EXISTING_VOLUMES=$(docker volume ls --format '{{.Name}}')
+  if [ -z "$USER_COMMAND_TARGETS" ]; then
+    USER_COMMAND_TARGETS="$EXISTING_VOLUMES"
+  fi
+  for VOLUME in $USER_COMMAND_TARGETS; do
+    if [[ "$EXISTING_VOLUMES" =~ "$VOLUME" ]]; then
+      docker run -e COMMAND=BACKUP -e VOLUME_NAME="$VOLUME" -v "$VOLUME":/var/src --mount type=bind,source="$BACKUP_DIRECTORY",target=/var/dst/ "$VOLUME_BACKUP_IMAGE"
+      if [ "$?" -ne "0" ]; then
+        echo ERROR could not backup volume \'"$VOLUME"\'
+      fi
+    else
+      echo ERROR volume \'"$VOLUME"\' was not found
+    fi
+  done
+fi
+
+if [ "$USER_COMMAND" = restore ]; then
+  EXISTING_VOLUMES=$(docker volume ls --format '{{.Name}}')
+  for BACKED_FILE in $USER_COMMAND_TARGETS; do
+    BACKED_FILE="$(cd "$(dirname "$BACKED_FILE")"; pwd -P)/$(basename "$BACKED_FILE")" # absolute path
+    if [ -f $BACKED_FILE ]; then
+      VOLUME_NAME=$(basename "$BACKED_FILE" | sed 's/\.tar$//')
+      if [[ "$EXISTING_VOLUMES" =~ "$VOLUME_NAME" ]]; then
+        if [ "$USE_FORCE" = "yes" ]; then
+          docker volume rm $VOLUME_NAME
+          if [ "$?" -ne "0" ]; then
+            docker container prune
+            docker volume rm $VOLUME_NAME
+          fi
+        else
+          echo WARNING: volume \'"$VOLUME_NAME"\' existing, it will not be restored, delete it... or use the force
+        fi
+      else
+        SINGLE_BACKUP_DIRECTORY=$(dirname "$BACKED_FILE")
+        docker volume create "$VOLUME_NAME" > /dev/null
+        if [ "$?" -ne "0" ]; then
+          echo ERROR could not create volume \'"$VOLUME_NAME"\'
+        fi
+        docker run -e COMMAND=RESTORE -e VOLUME_NAME="$VOLUME_NAME" -v "$VOLUME_NAME":/var/dst --mount type=bind,source="$SINGLE_BACKUP_DIRECTORY",target=/var/src/ "$VOLUME_BACKUP_IMAGE"
+        if [ "$?" -ne "0" ]; then
+          echo ERROR could not run restoration for \'"$VOLUME_NAME"\'
+        fi
+      fi
+    elif [ -d "$BACKED_FILE" ]; then
+      VOLUMES=$(find "$BACKED_FILE" -name '*.tar')
+      for VOLUME_NAME in $VOLUMES; do
+        VOLUME_NAME=$(basename $VOLUME_NAME| sed 's/\.tar//')
+        if [[ "$EXISTING_VOLUMES" =~ "$VOLUME_NAME" ]]; then
+          if [ "$USE_FORCE" = "yes" ]; then
+            docker volume rm $VOLUME_NAME
+            if [ "$?" -ne "0" ]; then
+              docker container prune
+              docker volume rm $VOLUME_NAME
+            fi
+          else
+            echo WARNING: volume \'"$VOLUME_NAME"\' existing, it will not be restored, delete it... or use the force
+          fi
+        else
+          docker volume create "$VOLUME_NAME" > /dev/null
+          if [ "$?" -ne "0" ]; then
+            echo ERROR could not create volume \'"$VOLUME_NAME"\'
+          fi
+          docker run -e COMMAND=RESTORE -e VOLUME_NAME="$VOLUME_NAME" -v "$VOLUME_NAME":/var/dst --mount type=bind,source="$BACKED_FILE",target=/var/src/ "$VOLUME_BACKUP_IMAGE"
+          if [ "$?" -ne "0" ]; then
+            echo ERROR could not run restoration for \'"$VOLUME_NAME"\'
+          fi
+        fi
+      done
+    else
+      echo ERROR tarball \'"$BACKED_FILE"\' does not exist
+    fi
+  done
+fi
+
+if [ "$USER_COMMAND" = clean ]; then
+  docker image rm "$VOLUME_BACKUP_IMAGE"
+  if [ "$?" -ne "0" ]; then
+    docker container prune
+    docker image rm "$VOLUME_BACKUP_IMAGE"
+  fi
+fi
